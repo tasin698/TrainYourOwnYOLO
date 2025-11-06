@@ -12,6 +12,7 @@ from tensorflow.keras.layers import (
     UpSampling2D,
     Concatenate,
     MaxPooling2D,
+    Lambda,
 )
 from tensorflow.keras.layers import LeakyReLU
 from tensorflow.keras.layers import BatchNormalization
@@ -138,48 +139,187 @@ def tiny_yolo_body(inputs, num_anchors, num_classes):
 def yolo_head(feats, anchors, num_classes, input_shape, calc_loss=False):
     """Convert final layer features to bounding box parameters."""
     num_anchors = len(anchors)
+    
     # Reshape to batch, height, width, num_anchors, box_params.
-    anchors_tensor = K.reshape(K.constant(anchors), [1, 1, 1, num_anchors, 2])
+    # We need to compute grid_shape from input_shape or use a placeholder
+    from tensorflow.keras import ops
+    # Use ops.reshape for KerasTensor compatibility
+    anchors_tensor = ops.reshape(K.constant(anchors), [1, 1, 1, num_anchors, 2])
+    
+    # Try to get static shape first
+    grid_h = None
+    grid_w = None
+    
+    if hasattr(feats, 'shape') and feats.shape is not None and len(feats.shape) >= 3:
+        try:
+            shape_list = feats.shape.as_list() if hasattr(feats.shape, 'as_list') else list(feats.shape)
+            if (len(shape_list) >= 3 and 
+                shape_list[1] is not None and shape_list[2] is not None and 
+                isinstance(shape_list[1], int) and isinstance(shape_list[2], int)):
+                # Static shape available - both are integers
+                grid_h = int(shape_list[1])
+                grid_w = int(shape_list[2])
+        except (AttributeError, IndexError, TypeError):
+            pass
+    
+    # Always set fallback values first to ensure we never have None
+    if grid_h is None or grid_w is None:
+        # Compute approximate grid_shape from input_shape
+        # The actual shape will be computed correctly during inference
+        if isinstance(input_shape, tf.Tensor):
+            # Use input_shape to compute grid (will be refined during execution)
+            # Default to 32x downsampling (largest grid)
+            grid_shape_fallback = tf.cast(input_shape / 32, tf.int32)
+            grid_h = tf.gather(grid_shape_fallback, 0)  # Use tf.gather for safe indexing
+            grid_w = tf.gather(grid_shape_fallback, 1)
+        else:
+            # Static computation from input_shape
+            try:
+                grid_h = int(input_shape[0] // 32) if input_shape[0] is not None else 13
+                grid_w = int(input_shape[1] // 32) if input_shape[1] is not None else 13
+            except (TypeError, IndexError):
+                # Ultimate fallback - use default YOLOv3 grid size
+                grid_h = 13
+                grid_w = 13
+        try:
+            shape_tensor = ops.shape(feats)
+            # Use tf.gather to safely extract dimensions
+            grid_h_dynamic = tf.cast(tf.gather(shape_tensor, 1), tf.int32)
+            grid_w_dynamic = tf.cast(tf.gather(shape_tensor, 2), tf.int32)
+            # Use dynamic shape (will override static during execution)
+            grid_h = grid_h_dynamic
+            grid_w = grid_w_dynamic
+        except (ValueError, TypeError, AttributeError):
+            # Keep the fallback values computed from input_shape
+            pass
+    
+    # Create grid_shape tensor
+    if isinstance(grid_h, (int, np.integer)) and isinstance(grid_w, (int, np.integer)):
+        grid_shape = tf.constant([grid_h, grid_w], dtype=tf.int32)
+    else:
+        grid_shape = tf.stack([tf.cast(grid_h, tf.int32), tf.cast(grid_w, tf.int32)])
+    
+    # Extract grid dimensions for use in tile operations
+    # Ensure we use tensor operations, not Python lists with mixed types
+    if isinstance(grid_h, (int, np.integer)):
+        grid_h_tensor = tf.constant(grid_h, dtype=tf.int32)
+    else:
+        grid_h_tensor = tf.cast(grid_h, tf.int32)
+    
+    if isinstance(grid_w, (int, np.integer)):
+        grid_w_tensor = tf.constant(grid_w, dtype=tf.int32)
+    else:
+        grid_w_tensor = tf.cast(grid_w, tf.int32)
+    
+    # Use ops operations for KerasTensor compatibility
+    arange_h = K.arange(0, stop=grid_h_tensor)  # Creates new tensor, OK
+    arange_w = K.arange(0, stop=grid_w_tensor)  # Creates new tensor, OK
+    grid_y = ops.tile(
+        ops.reshape(arange_h, [-1, 1, 1, 1]),
+        ops.stack([1, grid_w_tensor, 1, 1]),
+    )
+    grid_x = ops.tile(
+        ops.reshape(arange_w, [1, -1, 1, 1]),
+        ops.stack([grid_h_tensor, 1, 1, 1]),
+    )
+    # Concatenate along the last dimension to create [grid_h, grid_w, 1, 2]
+    grid = ops.concatenate([grid_x, grid_y], axis=-1)
+    # Get dtype from tensor attribute (works with KerasTensors)
+    # Convert to string if it's a DType object
+    if hasattr(feats, 'dtype'):
+        feats_dtype = feats.dtype
+        if hasattr(feats_dtype, 'name'):
+            feats_dtype = feats_dtype.name
+        elif not isinstance(feats_dtype, str):
+            feats_dtype = str(feats_dtype)
+    else:
+        feats_dtype = 'float32'
+    # Use ops operations for KerasTensor compatibility
+    grid = ops.cast(grid, feats_dtype)
+    # Reshape grid to [1, grid_h, grid_w, 1, 2] for proper broadcasting with [batch, grid_h, grid_w, num_anchors, 2]
+    # Handle both static and dynamic shapes
+    if isinstance(grid_h, (int, np.integer)) and isinstance(grid_w, (int, np.integer)):
+        grid = ops.reshape(grid, [1, int(grid_h), int(grid_w), 1, 2])
+    else:
+        # Use Lambda for dynamic reshape when dimensions are tensors (similar to feats reshape)
+        def reshape_grid(x):
+            """Reshape grid using grid dimensions computed from input tensor."""
+            # x has shape [grid_h, grid_w, 1, 2], extract dimensions and add batch dimension
+            grid_shape_tf = tf.shape(x)
+            grid_h_val = grid_shape_tf[0]
+            grid_w_val = grid_shape_tf[1]
+            grid_shape = tf.stack([1, grid_h_val, grid_w_val, 1, 2])
+            return tf.reshape(x, grid_shape)
+        grid = Lambda(reshape_grid)(grid)
 
-    grid_shape = K.shape(feats)[1:3]  # height, width
-    grid_y = K.tile(
-        K.reshape(K.arange(0, stop=grid_shape[0]), [-1, 1, 1, 1]),
-        [1, grid_shape[1], 1, 1],
-    )
-    grid_x = K.tile(
-        K.reshape(K.arange(0, stop=grid_shape[1]), [1, -1, 1, 1]),
-        [grid_shape[0], 1, 1, 1],
-    )
-    grid = K.concatenate([grid_x, grid_y])
-    grid = K.cast(grid, K.dtype(feats))
-
-    feats = K.reshape(
-        feats, [-1, grid_shape[0], grid_shape[1], num_anchors, num_classes + 5]
-    )
+    # Reshape feats: use static shape when available, otherwise compute dynamically
+    # If grid_h and grid_w are static integers, use a list shape
+    if isinstance(grid_h, (int, np.integer)) and isinstance(grid_w, (int, np.integer)):
+        # Use static shape - ops.reshape works with list of ints
+        feats = ops.reshape(feats, [-1, int(grid_h), int(grid_w), num_anchors, num_classes + 5])
+    else:
+        # Use dynamic shape - when grid_h/grid_w are tensors, we need to defer reshape until execution
+        # CRITICAL FIX: The grid is computed using grid_h_tensor and grid_w_tensor from ops.shape(feats)
+        # The Lambda must compute dimensions from the input tensor in the SAME way to ensure they match
+        # Instead of capturing the tensors (which may evaluate incorrectly), compute from input shape
+        def dynamic_reshape(x):
+            """Reshape feats using grid dimensions computed from input tensor (same method as grid)."""
+            # Compute shape the same way as grid computation (using ops.shape equivalent)
+            feats_shape = tf.shape(x)  # This works during execution
+            batch_size = feats_shape[0]
+            # Extract grid dimensions the same way as grid computation
+            # grid_h_tensor and grid_w_tensor were computed from ops.shape(feats)[1:3]
+            # So we compute from tf.shape(x)[1:3] here
+            grid_h_val = tf.cast(feats_shape[1], tf.int32)  # Height dimension
+            grid_w_val = tf.cast(feats_shape[2], tf.int32)  # Width dimension
+            num_anchors_tensor = tf.constant(num_anchors, dtype=tf.int32)
+            num_classes_tensor = tf.constant(num_classes + 5, dtype=tf.int32)
+            reshape_shape = tf.stack([batch_size, grid_h_val, grid_w_val, num_anchors_tensor, num_classes_tensor])
+            return tf.reshape(x, reshape_shape)
+        
+        feats = Lambda(dynamic_reshape)(feats)
 
     # Adjust preditions to each spatial grid point and anchor size.
-    box_xy = (K.sigmoid(feats[..., :2]) + grid) / K.cast(
-        grid_shape[::-1], K.dtype(feats)
+    # Reverse grid_shape: [w, h] instead of [h, w]
+    grid_shape_reversed = tf.stack([grid_w_tensor, grid_h_tensor])
+    # Get dtype from tensor attribute (works with KerasTensors)
+    # Reuse the dtype we already computed above
+    # Use ops operations for KerasTensor compatibility
+    box_xy = (ops.sigmoid(feats[..., :2]) + grid) / ops.cast(
+        grid_shape_reversed, feats_dtype
     )
+    # Handle input_shape reversal safely
+    if isinstance(input_shape, tf.Tensor):
+        input_shape_reversed = tf.reverse(input_shape, [0])
+    else:
+        input_shape_reversed = input_shape[::-1]
     box_wh = (
-        K.exp(feats[..., 2:4])
+        ops.exp(feats[..., 2:4])
         * anchors_tensor
-        / K.cast(input_shape[::-1], K.dtype(feats))
+        / ops.cast(input_shape_reversed, feats_dtype)
     )
-    box_confidence = K.sigmoid(feats[..., 4:5])
-    box_class_probs = K.sigmoid(feats[..., 5:])
+    box_confidence = ops.sigmoid(feats[..., 4:5])
+    box_class_probs = ops.sigmoid(feats[..., 5:])
 
     if calc_loss == True:
         return grid, feats, box_xy, box_wh
     return box_xy, box_wh, box_confidence, box_class_probs
 
 
+from tensorflow.keras import backend as K
+from tensorflow.keras import ops  # <-- NEW: Use keras.ops
+import tensorflow as tf
+
 def yolo_correct_boxes(box_xy, box_wh, input_shape, image_shape):
-    """Get corrected boxes"""
+    """Get corrected boxes - Keras 3 compatible"""
     box_yx = box_xy[..., ::-1]
     box_hw = box_wh[..., ::-1]
-    input_shape = K.cast(input_shape, K.dtype(box_yx))
-    image_shape = K.cast(image_shape, K.dtype(box_yx))
+
+    # Safe dtype
+    dtype = box_yx.dtype if hasattr(box_yx, 'dtype') else K.floatx()
+    input_shape = K.cast(input_shape, dtype)
+    image_shape = K.cast(image_shape, dtype)
+
     new_shape = K.round(image_shape * K.min(input_shape / image_shape))
     offset = (input_shape - new_shape) / 2.0 / input_shape
     scale = input_shape / new_shape
@@ -188,30 +328,79 @@ def yolo_correct_boxes(box_xy, box_wh, input_shape, image_shape):
 
     box_mins = box_yx - (box_hw / 2.0)
     box_maxes = box_yx + (box_hw / 2.0)
-    boxes = K.concatenate(
+
+    # Use ops.concatenate
+    boxes = ops.concatenate(
         [
             box_mins[..., 0:1],  # y_min
             box_mins[..., 1:2],  # x_min
-            box_maxes[..., 0:1],  # y_max
-            box_maxes[..., 1:2],  # x_max
-        ]
+            box_maxes[..., 0:1], # y_max
+            box_maxes[..., 1:2], # x_max
+        ],
+        axis=-1
     )
 
-    # Scale boxes back to original image shape.
-    boxes *= K.concatenate([image_shape, image_shape])
-    return boxes
+    # Use ops.repeat
+    image_shape_repeated = ops.repeat(image_shape, 2)
+    boxes *= image_shape_repeated
+
+    return boxes    
 
 
 def yolo_boxes_and_scores(feats, anchors, num_classes, input_shape, image_shape):
     """Process Conv layer output"""
+    from tensorflow.keras import ops
     box_xy, box_wh, box_confidence, box_class_probs = yolo_head(
         feats, anchors, num_classes, input_shape
     )
     boxes = yolo_correct_boxes(box_xy, box_wh, input_shape, image_shape)
-    boxes = K.reshape(boxes, [-1, 4])
+    # Use ops.reshape for KerasTensor compatibility
+    boxes = ops.reshape(boxes, [-1, 4])
     box_scores = box_confidence * box_class_probs
-    box_scores = K.reshape(box_scores, [-1, num_classes])
+    box_scores = ops.reshape(box_scores, [-1, num_classes])
     return boxes, box_scores
+
+
+from tensorflow.keras import ops
+from tensorflow.keras import backend as K
+import tensorflow as tf
+
+
+from tensorflow.keras import ops, backend as K
+from tensorflow.keras.layers import Lambda
+import tensorflow as tf
+
+
+from tensorflow.keras import ops, backend as K
+from tensorflow.keras.layers import Lambda
+import tensorflow as tf
+
+
+from tensorflow.keras import ops, backend as K
+from tensorflow.keras.layers import Lambda
+import tensorflow as tf
+
+
+from tensorflow.keras import ops, backend as K
+import tensorflow as tf
+
+
+from tensorflow.keras import ops, backend as K
+import tensorflow as tf
+
+
+from tensorflow.keras import ops, backend as K
+import tensorflow as tf
+
+
+from tensorflow.keras import ops, backend as K
+from tensorflow.keras.layers import Lambda
+import tensorflow as tf
+
+
+from tensorflow.keras import ops, backend as K
+from tensorflow.keras.layers import Lambda
+import tensorflow as tf
 
 
 def yolo_eval(
@@ -227,8 +416,20 @@ def yolo_eval(
     num_layers = len(yolo_outputs)
     anchor_mask = (
         [[6, 7, 8], [3, 4, 5], [0, 1, 2]] if num_layers == 3 else [[3, 4, 5], [1, 2, 3]]
-    )  # default setting
-    input_shape = K.shape(yolo_outputs[0])[1:3] * 32
+    )
+
+    # Safe input_shape
+    if isinstance(image_shape, tf.Tensor):
+        input_shape = ops.cast(image_shape, "float32")
+    elif isinstance(image_shape, (list, tuple)):
+        input_shape = ops.convert_to_tensor([float(image_shape[0]), float(image_shape[1])])
+    else:
+        try:
+            output_shape = ops.shape(yolo_outputs[0])
+            input_shape = ops.cast(output_shape[1:3], "float32") * 32
+        except:
+            input_shape = ops.convert_to_tensor([416.0, 416.0])
+
     boxes = []
     box_scores = []
     for l in range(num_layers):
@@ -241,32 +442,49 @@ def yolo_eval(
         )
         boxes.append(_boxes)
         box_scores.append(_box_scores)
-    boxes = K.concatenate(boxes, axis=0)
-    box_scores = K.concatenate(box_scores, axis=0)
+
+    boxes = ops.concatenate(boxes, axis=0)
+    box_scores = ops.concatenate(box_scores, axis=0)
 
     mask = box_scores >= score_threshold
-    max_boxes_tensor = K.constant(max_boxes, dtype="int32")
+    max_boxes_tensor = ops.convert_to_tensor(max_boxes, dtype="int32")
+
+    # === Lambda layer with output_shape ===
+    def nms_per_class(inputs):
+        boxes, box_scores, mask, c = inputs
+        mask_c = tf.gather(mask, c, axis=1)
+        scores_c = tf.gather(box_scores, c, axis=1)
+        boxes_c = tf.boolean_mask(boxes, mask_c)
+        scores_c = tf.boolean_mask(scores_c, mask_c)
+        nms_idx = tf.image.non_max_suppression(
+            boxes_c, scores_c, max_boxes_tensor, iou_threshold=iou_threshold
+        )
+        boxes_c = tf.gather(boxes_c, nms_idx)
+        scores_c = tf.gather(scores_c, nms_idx)
+        classes_c = tf.fill(tf.shape(scores_c), c)
+        return boxes_c, scores_c, classes_c
+
+    nms_layer = Lambda(
+        nms_per_class,
+        output_shape=((None, 4), (None,), (None,))  # boxes, scores, classes
+    )
+    # =====================================
+
     boxes_ = []
     scores_ = []
     classes_ = []
     for c in range(num_classes):
-        # TODO: use keras backend instead of tf.
-        class_boxes = tf.boolean_mask(boxes, mask[:, c])
-        class_box_scores = tf.boolean_mask(box_scores[:, c], mask[:, c])
-        nms_index = tf.image.non_max_suppression(
-            class_boxes, class_box_scores, max_boxes_tensor, iou_threshold=iou_threshold
-        )
-        class_boxes = K.gather(class_boxes, nms_index)
-        class_box_scores = K.gather(class_box_scores, nms_index)
-        classes = K.ones_like(class_box_scores, "int32") * c
-        boxes_.append(class_boxes)
-        scores_.append(class_box_scores)
-        classes_.append(classes)
-    boxes_ = K.concatenate(boxes_, axis=0)
-    scores_ = K.concatenate(scores_, axis=0)
-    classes_ = K.concatenate(classes_, axis=0)
+        result = nms_layer([boxes, box_scores, mask, tf.constant(c, dtype=tf.int32)])
+        boxes_.append(result[0])
+        scores_.append(result[1])
+        classes_.append(result[2])
+
+    boxes_ = ops.concatenate(boxes_, axis=0)
+    scores_ = ops.concatenate(scores_, axis=0)
+    classes_ = ops.concatenate(classes_, axis=0)
 
     return boxes_, scores_, classes_
+
 
 
 def preprocess_true_boxes(true_boxes, input_shape, anchors, num_classes):
@@ -457,25 +675,61 @@ def yolo_loss(args, anchors, num_classes, ignore_thresh=0.5, print_loss=False):
         box_loss_scale = 2 - y_true[l][..., 2:3] * y_true[l][..., 3:4]
 
         # Find ignore mask, iterate over each of batch.
-        ignore_mask = tf.TensorArray(K.dtype(y_true[0]), size=1, dynamic_size=True)
+        # For TensorFlow 2.x, use a simpler approach with tf.map_fn
         object_mask_bool = K.cast(object_mask, "bool")
-
-        def loop_body(b, ignore_mask):
+        
+        # Get batch size from pred_box
+        pred_shape = K.shape(pred_box)
+        batch_size = pred_shape[0]
+        
+        def compute_ignore_mask(b):
+            """Compute ignore mask for a single batch item"""
+            # Get true boxes for this batch item
             true_box = tf.boolean_mask(
                 y_true[l][b, ..., 0:4], object_mask_bool[b, ..., 0]
             )
-            iou = box_iou(pred_box[b], true_box)
-            best_iou = K.max(iou, axis=-1)
-            ignore_mask = ignore_mask.write(
-                b, K.cast(best_iou < ignore_thresh, K.dtype(true_box))
+            
+            # Get the shape of pred_box for this batch item
+            pred_box_b = pred_box[b]  # shape: (grid_h, grid_w, num_anchors, 4)
+            pred_box_shape = K.shape(pred_box_b)
+            gh = pred_box_shape[0]
+            gw = pred_box_shape[1]
+            na = pred_box_shape[2]
+            
+            # Check if there are any true boxes using TensorFlow operations
+            num_true_boxes = tf.shape(true_box)[0]
+            has_boxes = tf.greater(num_true_boxes, 0)
+            
+            # If no true boxes, return zeros; otherwise compute IoU
+            def compute_with_boxes():
+                # Reshape pred_box to (grid_h * grid_w * num_anchors, 4)
+                pred_boxes_flat = K.reshape(pred_box_b, [-1, 4])
+                
+                # Compute IoU: (grid_h * grid_w * num_anchors, num_true_boxes)
+                iou = box_iou(pred_boxes_flat, true_box)  # Returns (grid_h * grid_w * num_anchors, num_true_boxes)
+                best_iou = K.max(iou, axis=-1)  # (grid_h * grid_w * num_anchors,)
+                
+                # Reshape back to (grid_h, grid_w, num_anchors)
+                best_iou = K.reshape(best_iou, [gh, gw, na])
+                
+                # Return mask: 1 if should ignore (best_iou < threshold), 0 otherwise
+                return K.cast(best_iou < ignore_thresh, K.dtype(y_true[0]))
+            
+            def return_zeros():
+                return tf.zeros([gh, gw, na], dtype=K.dtype(y_true[0]))
+            
+            # Use tf.cond for conditional execution
+            return tf.cond(has_boxes, compute_with_boxes, return_zeros)
+        
+        ignore_mask = tf.map_fn(
+            compute_ignore_mask,
+            tf.range(batch_size),
+            fn_output_signature=tf.TensorSpec(
+                shape=[None, None, None],  # [grid_h, grid_w, num_anchors]
+                dtype=K.dtype(y_true[0])
             )
-            return b + 1, ignore_mask
-
-        _, ignore_mask = tf.while_loop(
-            lambda b, *args: b < m, loop_body, [0, ignore_mask]
         )
-        ignore_mask = ignore_mask.stack()
-        ignore_mask = K.expand_dims(ignore_mask, -1)
+        ignore_mask = K.expand_dims(ignore_mask, -1)  # Add last dimension: (batch, grid_h, grid_w, num_anchors, 1)
 
         # K.binary_crossentropy is helpful to avoid exp overflow.
         xy_loss = (
@@ -506,16 +760,15 @@ def yolo_loss(args, anchors, num_classes, ignore_thresh=0.5, print_loss=False):
         class_loss = K.sum(class_loss) / mf
         loss += xy_loss + wh_loss + confidence_loss + class_loss
         if print_loss:
-            loss = tf.Print(
-                loss,
-                [
-                    loss,
-                    xy_loss,
-                    wh_loss,
-                    confidence_loss,
-                    class_loss,
-                    K.sum(ignore_mask),
-                ],
-                message="loss: ",
+            # Use tf.py_function to print in TensorFlow 2.x
+            def print_loss_fn(loss_val, xy, wh, conf, cls, ign):
+                print(f"loss: {loss_val:.4f} xy: {xy:.4f} wh: {wh:.4f} conf: {conf:.4f} cls: {cls:.4f} ignore: {ign:.4f}")
+                return loss_val
+            
+            loss = tf.py_function(
+                print_loss_fn,
+                [loss, xy_loss, wh_loss, confidence_loss, class_loss, K.sum(ignore_mask)],
+                tf.float32
             )
+            loss.set_shape([])  # Ensure shape is preserved
     return loss
