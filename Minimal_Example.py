@@ -23,7 +23,11 @@ if not os.path.exists(output_folder):
 
 # First download the pre-trained weights from https://drive.google.com/u/0/uc?id=1MGXAP_XD_w4OExPP10UHsejWrMww8Tu7&export=download
 
-if not os.path.isfile(os.path.join(model_folder, "trained_weights_final.h5")):
+# Check for .weights.h5 first (TensorFlow 2.10+ format), fallback to .h5 for backward compatibility
+weights_file = os.path.join(model_folder, "trained_weights_final.weights.h5")
+if not os.path.isfile(weights_file):
+    weights_file = os.path.join(model_folder, "trained_weights_final.h5")
+if not os.path.isfile(weights_file):
     print("\n", "Downloading Pretrained Weights", "\n")
     if not os.path.exists(output_folder):
         os.mkdir(model_folder)
@@ -50,7 +54,7 @@ detector_script = os.path.join(
 
 
 result_file = os.path.join(output_folder, "Detection_Results.csv")
-model_weights = os.path.join(model_folder, "trained_weights_final.h5")
+model_weights = weights_file
 classes_file = os.path.join(model_folder, "data_classes.txt")
 anchors = os.path.join(
     root_folder, "2_Training", "src", "keras_yolo3", "model_data", "yolo_anchors.txt"
