@@ -44,7 +44,11 @@ detection_results_file = os.path.join(detection_results_folder, "Detection_Resul
 
 model_folder = os.path.join(data_folder, "Model_Weights")
 
-model_weights = os.path.join(model_folder, "trained_weights_final.h5")
+# Check for .weights.h5 first (TensorFlow 2.10+ format), fallback to .h5 for backward compatibility
+model_weights = os.path.join(model_folder, "trained_weights_final.weights.h5")
+if not os.path.isfile(model_weights):
+    model_weights = os.path.join(model_folder, "trained_weights_final.h5")
+
 model_classes = os.path.join(model_folder, "data_classes.txt")
 
 anchors_path = os.path.join(src_path, "keras_yolo3", "model_data", "yolo_anchors.txt")
@@ -127,6 +131,7 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--box_file",
+        "--box",
         type=str,
         dest="box",
         default=detection_results_file,
@@ -246,8 +251,7 @@ if __name__ == "__main__":
             )
             y_size, x_size, _ = np.array(image).shape
             for single_prediction in prediction:
-                out_df = out_df.append(
-                    pd.DataFrame(
+                n_row = pd.DataFrame(
                         [
                             [
                                 os.path.basename(img_path.rstrip("\n")),
@@ -269,7 +273,7 @@ if __name__ == "__main__":
                             "y_size",
                         ],
                     )
-                )
+                    out_df = pd.concat([out_df, new_row], ignore_index=True)
         end = timer()
         print(
             "Processed {} images in {:.1f}sec - {:.1f}FPS".format(
