@@ -1,57 +1,66 @@
 import os
+import cv2
+import numpy as np
 import sys
+import argparse
+from PIL import Image
+from timeit import default_timer as timer
+import pandas as pd
 
+# --- TTA Function ---
+def apply_tta(image):
+    """Applies Test-Time Augmentation (horizontal flip)."""
+    flipped = cv2.flip(image, 1)
+    return [image, flipped]
 
+# --- Path Setup ---
 def get_parent_dir(n=1):
     """returns the n-th parent dicrectory of the current
     working directory"""
-    current_path = os.path.dirname(os.path.abspath(__file__))
+    # Use os.path.realpath to get the actual file path in Colab
+    current_path = os.path.dirname(os.path.realpath(__file__))
     for _ in range(n):
         current_path = os.path.dirname(current_path)
     return current_path
 
+# Note: In Colab, __file__ isn't defined. This script is intended to be run
+# from the command line, so we'll assume a standard structure.
+# For Colab, paths are often absolute, e.g., /content/TrainYourOwnYOLO/
+base_path = "/content/TrainYourOwnYOLO" # Adjust if your repo clone is named differently
 
-src_path = os.path.join(get_parent_dir(1), "2_Training", "src")
-utils_path = os.path.join(get_parent_dir(1), "Utils")
+src_path = os.path.join(base_path, "2_Training", "src")
+utils_path = os.path.join(base_path, "Utils")
 
 sys.path.append(src_path)
 sys.path.append(utils_path)
 
-import argparse
 from keras_yolo3.yolo import YOLO, detect_video, detect_webcam
-from PIL import Image
-from timeit import default_timer as timer
 from utils import load_extractor_model, load_features, parse_input, detect_object
-import test
-import utils
-import pandas as pd
-import numpy as np
+# import test # Not used
+# import utils # Already imported detect_object
 from Get_File_Paths import GetFileList
-import random
+# import random # Not used
 from Train_Utils import get_anchors
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 # Set up folder names for default values
-data_folder = os.path.join(get_parent_dir(n=1), "Data")
-
+data_folder = os.path.join(base_path, "Data")
 image_folder = os.path.join(data_folder, "Source_Images")
-
-image_test_folder = os.path.join(image_folder, "Test_Images")
-
+image_test_folder = os.path.join(image_folder, "MyTest_Images")
 detection_results_folder = os.path.join(image_folder, "Test_Image_Detection_Results")
 detection_results_file = os.path.join(detection_results_folder, "Detection_Results.csv")
-
 model_folder = os.path.join(data_folder, "Model_Weights")
 
 # Check for .weights.h5 first (TensorFlow 2.10+ format), fallback to .h5 for backward compatibility
 model_weights = os.path.join(model_folder, "trained_weights_final.weights.h5")
 if not os.path.isfile(model_weights):
     model_weights = os.path.join(model_folder, "trained_weights_final.h5")
-
 model_classes = os.path.join(model_folder, "data_classes.txt")
 
-anchors_path = os.path.join(src_path, "keras_yolo3", "model_data", "yolo_anchors.txt")
+# This path might be different if you are in 3_Inference
+# Let's use the base_path
+anchors_path = os.path.join(base_path, "2_Training", "src", "keras_yolo3", "model_data", "yolo_anchors.txt")
 
 FLAGS = None
 
@@ -131,7 +140,6 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--box_file",
-        "--box",
         type=str,
         dest="box",
         default=detection_results_file,
@@ -160,13 +168,28 @@ if __name__ == "__main__":
         action="store_true",
         help="Use webcam for real-time detection. Default is False.",
     )
+    
+    # --- NEW ARGUMENTS ---
+    
+    parser.add_argument(
+        "--nms",
+        type=float,
+        dest="nms_threshold",
+        default=0.45,
+        help="Non-Max Suppression threshold. Default is 0.45.",
+    )
+    
+    parser.add_argument(
+        "--tta",
+        default=False,
+        action="store_true",
+        help="Use Test-Time Augmentation (horizontal flip). Default is False.",
+    )
 
     FLAGS = parser.parse_args()
 
     save_img = not FLAGS.no_save_img
-
     file_types = FLAGS.file_types
-
     webcam_active = FLAGS.webcam
 
     if file_types:
@@ -181,6 +204,14 @@ if __name__ == "__main__":
     input_image_paths = []
     input_video_paths = []
     for item in input_paths:
+        item_normalized = str(item).lower()
+        item_basename = os.path.basename(item)
+        
+        if (item_basename.startswith("._") or 
+            "__macosx" in item_normalized or 
+            item_basename.startswith(".DS_Store")):
+            continue
+            
         if item.endswith(img_endings):
             input_image_paths.append(item)
         elif item.endswith(vid_endings):
@@ -203,6 +234,7 @@ if __name__ == "__main__":
             "anchors_path": anchors_path,
             "classes_path": FLAGS.classes_path,
             "score": FLAGS.score,
+            "nms_threshold": FLAGS.nms_threshold, # <-- NEW NMS FLAG USED HERE
             "gpu_num": FLAGS.gpu_num,
             "model_image_size": (416, 416),
         }
@@ -211,16 +243,8 @@ if __name__ == "__main__":
     # Make a dataframe for the prediction outputs
     out_df = pd.DataFrame(
         columns=[
-            "image",
-            "image_path",
-            "xmin",
-            "ymin",
-            "xmax",
-            "ymax",
-            "label",
-            "confidence",
-            "x_size",
-            "y_size",
+            "image", "image_path", "xmin", "ymin", "xmax", "ymax",
+            "label", "confidence", "x_size", "y_size",
         ]
     )
 
@@ -239,19 +263,85 @@ if __name__ == "__main__":
         start = timer()
         text_out = ""
 
-        # This is for images
+        # --- MODIFIED MAIN LOOP ---
         for i, img_path in enumerate(input_image_paths):
-            print(img_path)
-            prediction, image = detect_object(
-                yolo,
-                img_path,
-                save_img=save_img,
-                save_img_path=FLAGS.output,
-                postfix=FLAGS.postfix,
-            )
-            y_size, x_size, _ = np.array(image).shape
-            for single_prediction in prediction:
-                n_row = pd.DataFrame(
+            print(f"Processing {img_path} ({i+1}/{len(input_image_paths)})")
+            
+            # This list will hold all predictions for this image (original + TTA)
+            final_predictions_for_this_image = []
+            
+            # --- 1. Original Detection ---
+            try:
+                prediction, image = detect_object(
+                    yolo,
+                    img_path,
+                    save_img=save_img,
+                    save_img_path=FLAGS.output,
+                    postfix=FLAGS.postfix,
+                )
+            except Exception as e:
+                print(f"Skipping {img_path} - error during original detection: {e}")
+                continue
+            
+            if image is None:
+                print(f"Skipping {img_path} - file could not be opened")
+                continue
+                
+            try:
+                image_array = np.asarray(image)
+                if image_array.size == 0 or len(image_array.shape) < 3:
+                    print(f"Skipping {img_path} - invalid image shape: {image_array.shape}")
+                    continue
+                y_size, x_size, _ = image_array.shape
+            except (ValueError, AttributeError, TypeError) as e:
+                print(f"Skipping {img_path} - error processing image: {e}")
+                continue
+
+            if prediction is not None and len(prediction) > 0:
+                final_predictions_for_this_image.extend(prediction)
+
+            # --- 2. TTA (Flip) Detection (if enabled) ---
+            if FLAGS.tta:
+                temp_img_path = "temp_tta_flip.jpg"
+                try:
+                    # Use the loaded image array, flip, and save temporarily
+                    flipped_np = cv2.flip(image_array, 1)
+                    flipped_pil = Image.fromarray(flipped_np)
+                    flipped_pil.save(temp_img_path)
+                    
+                    # Run detection on the temporary flipped image
+                    prediction_flipped, _ = detect_object(
+                        yolo,
+                        temp_img_path,
+                        save_img=False,  # Don't save the annotated TTA image
+                        save_img_path=FLAGS.output,
+                        postfix=FLAGS.postfix,
+                    )
+                    
+                    if prediction_flipped is not None and len(prediction_flipped) > 0:
+                        un_flipped_preds = []
+                        for pred in prediction_flipped:
+                            # pred = [xmin, ymin, xmax, ymax, label, confidence]
+                            xmin, ymin, xmax, ymax, label, confidence = pred
+                            
+                            # "Un-flip" the coordinates
+                            new_xmin = x_size - xmax
+                            new_xmax = x_size - xmin
+                            
+                            un_flipped_preds.append([new_xmin, ymin, new_xmax, ymax, label, confidence])
+                        
+                        final_predictions_for_this_image.extend(un_flipped_preds)
+                        
+                except Exception as e:
+                    print(f"Error during TTA processing for {img_path}: {e}")
+                finally:
+                    if os.path.exists(temp_img_path):
+                        os.remove(temp_img_path) # Clean up temp file
+
+            # --- 3. Add all collected predictions to DataFrame ---
+            if len(final_predictions_for_this_image) > 0:
+                for single_prediction in final_predictions_for_this_image:
+                    new_row = pd.DataFrame(
                         [
                             [
                                 os.path.basename(img_path.rstrip("\n")),
@@ -261,19 +351,12 @@ if __name__ == "__main__":
                             + [x_size, y_size]
                         ],
                         columns=[
-                            "image",
-                            "image_path",
-                            "xmin",
-                            "ymin",
-                            "xmax",
-                            "ymax",
-                            "label",
-                            "confidence",
-                            "x_size",
-                            "y_size",
+                            "image", "image_path", "xmin", "ymin", "xmax", "ymax",
+                            "label", "confidence", "x_size", "y_size",
                         ],
                     )
                     out_df = pd.concat([out_df, new_row], ignore_index=True)
+            
         end = timer()
         print(
             "Processed {} images in {:.1f}sec - {:.1f}FPS".format(
@@ -284,8 +367,7 @@ if __name__ == "__main__":
         )
         out_df.to_csv(FLAGS.box, index=False)
 
-    # This is for videos
-    # for pre-recorded videos present in the Test_Images folder
+    # --- Video and Webcam processing (unchanged) ---
     if input_video_paths and not webcam_active:
         print(
             "Found {} input videos: {} ...".format(
@@ -307,7 +389,7 @@ if __name__ == "__main__":
                 len(input_video_paths), end - start
             )
         )
-    # for Webcam
+
     if webcam_active:
         start = timer()
         detect_webcam(yolo)
