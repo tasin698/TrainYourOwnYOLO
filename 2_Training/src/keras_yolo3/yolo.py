@@ -15,11 +15,9 @@ from PIL import Image, ImageFont, ImageDraw
 from .yolo3.model import yolo_eval, yolo_body, tiny_yolo_body
 from .yolo3.utils import letterbox_image
 import os
-from tensorflow.keras.utils import multi_gpu_model
-import tensorflow.compat.v1 as tf
-import tensorflow.python.keras.backend as K
+import tensorflow as tf
 
-tf.disable_eager_execution()
+import tensorflow.python.keras.backend as K
 
 
 class YOLO(object):
@@ -64,7 +62,24 @@ class YOLO(object):
 
     def generate(self):
         model_path = os.path.expanduser(self.model_path)
-        assert model_path.endswith(".h5"), "Keras model or weights must be a .h5 file."
+        # Accept both .h5 and .weights.h5 extensions
+        assert model_path.endswith(".h5") or model_path.endswith(".weights.h5"), \
+            "Keras model or weights must be a .h5 or .weights.h5 file."
+
+        # Check for .weights.h5 first (TensorFlow 2.10+ format), fallback to .h5 for backward compatibility
+        if not os.path.isfile(model_path):
+            # Try alternate extension if file doesn't exist
+            base_path = model_path.replace(".weights.h5", "").replace(".h5", "")
+            weights_path = base_path + ".weights.h5"
+            h5_path = base_path + ".h5"
+            
+            # Prefer .weights.h5 (TensorFlow 2.10+ format), then .h5
+            if os.path.isfile(weights_path):
+                model_path = weights_path
+                self.model_path = model_path
+            elif os.path.isfile(h5_path):
+                model_path = h5_path
+                self.model_path = model_path
 
         # Load model, or construct model and load weights.
         start = timer()
@@ -84,7 +99,7 @@ class YOLO(object):
                 )
             )
             self.yolo_model.load_weights(
-                self.model_path
+                model_path
             )  # make sure model, anchors and classes match
         else:
             assert self.yolo_model.layers[-1].output_shape[-1] == num_anchors / len(
@@ -122,14 +137,12 @@ class YOLO(object):
             np.random.seed(None)  # Reset seed to default.
 
         # Generate output tensor targets for filtered bounding boxes.
-        self.input_image_shape = K.placeholder(shape=(2,))
-        if self.gpu_num >= 2:
-            self.yolo_model = multi_gpu_model(self.yolo_model, gpus=self.gpu_num)
+        dummy_shape = tf.constant([416, 416], dtype=tf.float32)
         boxes, scores, classes = yolo_eval(
             self.yolo_model.output,
             self.anchors,
             len(self.class_names),
-            self.input_image_shape,
+            dummy_shape, #placeholder
             score_threshold=self.score,
             iou_threshold=self.iou,
         )
@@ -142,26 +155,46 @@ class YOLO(object):
             assert self.model_image_size[0] % 32 == 0, "Multiples of 32 required"
             assert self.model_image_size[1] % 32 == 0, "Multiples of 32 required"
             boxed_image = letterbox_image(image, tuple(reversed(self.model_image_size)))
+            input_shape = tf.constant(self.model_image_size, dtype=tf.float32)
         else:
             new_image_size = (
                 image.width - (image.width % 32),
                 image.height - (image.height % 32),
             )
             boxed_image = letterbox_image(image, new_image_size)
+            input_shape = tf.constant([new_image_size[1], new_image_size[0]], dtype=tf.float32)
         image_data = np.array(boxed_image, dtype="float32")
         if show_stats:
             print(image_data.shape)
         image_data /= 255.0
         image_data = np.expand_dims(image_data, 0)  # Add batch dimension.
 
-        out_boxes, out_scores, out_classes = self.sess.run(
-            [self.boxes, self.scores, self.classes],
-            feed_dict={
-                self.yolo_model.input: image_data,
-                self.input_image_shape: [image.size[1], image.size[0]],
-                K.learning_phase(): 0,
-            },
+         # Get predictions using eager execution
+        model_outputs = self.yolo_model(image_data, training=False)
+        
+        # YOLO models return list of tensors [y1, y2, y3] for full YOLO or [y1, y2] for tiny
+        # Ensure model_outputs is a list (in case it's a tuple or single tensor)
+        if isinstance(model_outputs, tuple):
+            model_outputs = list(model_outputs)
+        elif not isinstance(model_outputs, list):
+            model_outputs = [model_outputs]
+        
+        # Re-evaluate boxes with correct image shape
+        image_shape_tensor = tf.constant([image.size[1], image.size[0]], dtype=tf.float32)
+        boxes, scores, classes = yolo_eval(
+            model_outputs,
+            self.anchors,
+            len(self.class_names),
+            image_shape_tensor,
+            score_threshold=self.score,
+            iou_threshold=self.iou,
         )
+        # Convert tensors to numpy arrays
+        out_boxes = boxes.numpy()
+        out_scores = scores.numpy()
+        out_classes = classes.numpy()
+
+        
         if show_stats:
             print("Found {} boxes for {}".format(len(out_boxes), "img"))
         out_prediction = []
@@ -179,7 +212,11 @@ class YOLO(object):
 
             label = "{} {:.2f}".format(predicted_class, score)
             draw = ImageDraw.Draw(image)
-            label_size = draw.textsize(label, font)
+            try:
+                bbox = draw.textbbox((0, 0), label, font=font)
+                label_size = (bbox[2] - bbox[0], bbox[3] - bbox[1])
+            except AttributeError:
+                label_size = draw.textsize(label, font)
 
             top, left, bottom, right = box
             top = max(0, np.floor(top + 0.5).astype("int32"))
@@ -187,6 +224,9 @@ class YOLO(object):
             bottom = min(image.size[1], np.floor(bottom + 0.5).astype("int32"))
             right = min(image.size[0], np.floor(right + 0.5).astype("int32"))
 
+            # Check bounding box coordinates: ensure left < right and top < bottom
+            if top >= bottom or left >= right:
+                continue
             # image was expanded to model_image_size: make sure it did not pick
             # up any box outside of original image (run into this bug when
             # lowering confidence threshold to 0.01)
@@ -222,7 +262,7 @@ class YOLO(object):
         return out_prediction, image
 
     def close_session(self):
-        self.sess.close()
+        pass
 
 
 def detect_video(yolo, video_path, output_path=""):
@@ -259,6 +299,7 @@ def detect_video(yolo, video_path, output_path=""):
         image = Image.fromarray(frame)
         out_pred, image = yolo.detect_image(image, show_stats=False)
         result = np.asarray(image)
+        result = result.copy()
         curr_time = timer()
         exec_time = curr_time - prev_time
         prev_time = curr_time
