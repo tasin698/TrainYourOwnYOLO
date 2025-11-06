@@ -45,8 +45,9 @@ from keras_yolo3.yolo3.model import (
 from keras_yolo3.yolo3.utils import get_random_data
 from PIL import Image
 from time import time
-import tensorflow.compat.v1 as tf
+import tensorflow as tf
 import pickle
+import logging
 
 from Train_Utils import (
     get_classes,
@@ -129,7 +130,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--random_seed",
-        type=float,
+        type=int,
         default=None,
         help="Random seed value to make script deterministic. Default is 'None', i.e. non-deterministic.",
     )
@@ -149,7 +150,7 @@ if __name__ == "__main__":
     FLAGS = parser.parse_args()
 
     if not FLAGS.warnings:
-        tf.logging.set_verbosity(tf.logging.ERROR)
+        logging.getLogger("tensorflow").setLevel(logging.ERROR)
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
         warnings.filterwarnings("ignore")
 
@@ -169,7 +170,8 @@ if __name__ == "__main__":
     except (ImportError, AttributeError):
         _has_wandb = False
 
-    np.random.seed(FLAGS.random_seed)
+    if FLAGS.random_seed is not None:
+        np.random.seed(int(FLAGS.random_seed))
 
     log_dir = FLAGS.log_dir
 
@@ -193,24 +195,36 @@ if __name__ == "__main__":
     input_shape = (416, 416)  # multiple of 32, height, width
     epoch1, epoch2 = FLAGS.epochs, FLAGS.epochs
 
+    # Check if training from scratch (empty weights path)
+    load_pretrained = True
+    if not weights_path or weights_path.strip() == "" or not os.path.isfile(weights_path):
+        load_pretrained = False
+        print("Training from scratch (no pretrained weights)")
+        freeze_body = 0  # Don't freeze when training from scratch
+    else:
+        freeze_body = 2  # Freeze majority layers when using pretrained weights
+
     is_tiny_version = len(anchors) == 6  # default setting
     if FLAGS.is_tiny:
         model = create_tiny_model(
-            input_shape, anchors, num_classes, freeze_body=2, weights_path=weights_path
+            input_shape, anchors, num_classes, 
+            load_pretrained=load_pretrained, 
+            freeze_body=freeze_body, 
+            weights_path=weights_path
         )
     else:
         model = create_model(
-            input_shape, anchors, num_classes, freeze_body=2, weights_path=weights_path
+            input_shape, anchors, num_classes, load_pretrained=load_pretrained,
+            freeze_body=freeze_body, weights_path=weights_path
         )  # make sure you know what you freeze
 
     log_dir_time = os.path.join(log_dir, "{}".format(int(time())))
     logging = TensorBoard(log_dir=log_dir_time)
     checkpoint = ModelCheckpoint(
-        os.path.join(log_dir, "checkpoint.h5"),
+        os.path.join(log_dir, "checkpoint.weights.h5"),
         monitor="val_loss",
         save_weights_only=True,
         save_best_only=True,
-        period=5,
     )
     reduce_lr = ReduceLROnPlateau(monitor="val_loss", factor=0.1, patience=3, verbose=1)
     early_stopping = EarlyStopping(
@@ -240,7 +254,7 @@ if __name__ == "__main__":
         frozen_callbacks.append(wandb_callback)
 
     model.compile(
-        optimizer=Adam(lr=1e-3),
+        optimizer=Adam(learning_rate=1e-3),
         loss={
             # use custom yolo_loss Lambda layer.
             "yolo_loss": lambda y_true, y_pred: y_pred
@@ -253,7 +267,7 @@ if __name__ == "__main__":
             num_train, num_val, batch_size
         )
     )
-    history = model.fit_generator(
+    history = model.fit(
         data_generator_wrapper(
             lines[:num_train], batch_size, input_shape, anchors, num_classes
         ),
@@ -266,7 +280,7 @@ if __name__ == "__main__":
         initial_epoch=0,
         callbacks=frozen_callbacks,
     )
-    model.save_weights(os.path.join(log_dir, "trained_weights_stage_1.h5"))
+    model.save_weights(os.path.join(log_dir, "trained_weights_stage_1.weights.h5"))
 
     # Unfreeze and continue training, to fine-tune.
     # Train longer if the result is unsatisfactory.
@@ -279,7 +293,7 @@ if __name__ == "__main__":
     for i in range(len(model.layers)):
         model.layers[i].trainable = True
     model.compile(
-        optimizer=Adam(lr=1e-4), loss={"yolo_loss": lambda y_true, y_pred: y_pred}
+        optimizer=Adam(learning_rate=1e-4), loss={"yolo_loss": lambda y_true, y_pred: y_pred}
     )  # recompile to apply the change
 
     print("Unfreeze all layers.")
@@ -290,7 +304,7 @@ if __name__ == "__main__":
             num_train, num_val, batch_size
         )
     )
-    history = model.fit_generator(
+    history = model.fit(
         data_generator_wrapper(
             lines[:num_train], batch_size, input_shape, anchors, num_classes
         ),
@@ -303,4 +317,5 @@ if __name__ == "__main__":
         initial_epoch=epoch1,
         callbacks=full_callbacks,
     )
-    model.save_weights(os.path.join(log_dir, "trained_weights_final.h5"))
+    model.save_weights(os.path.join(log_dir, "trained_weights_final.weights.h5"))
+    model.save(os.path.join(log_dir, "trained_model_final.keras"))
