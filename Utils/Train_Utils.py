@@ -21,6 +21,7 @@ src_path = os.path.join(get_parent_dir(2), "src")
 sys.path.append(src_path)
 
 import numpy as np
+import tensorflow as tf
 import tensorflow.keras.backend as K
 from tensorflow.keras.layers import Input, Lambda
 from tensorflow.keras.models import Model
@@ -182,7 +183,7 @@ def create_tiny_model(
 
 
 def data_generator(annotation_lines, batch_size, input_shape, anchors, num_classes):
-    """data generator for fit_generator"""
+    """data generator for fit"""
     n = len(annotation_lines)
     i = 0
     while True:
@@ -207,7 +208,28 @@ def data_generator_wrapper(
     n = len(annotation_lines)
     if n == 0 or batch_size <= 0:
         return None
-    return data_generator(
+    # Calculate output shapes for y_true layers
+    num_layers = len(anchors) // 3
+    input_shape_arr = np.array(input_shape, dtype="int32")
+    grid_shapes = [input_shape_arr // {0: 32, 1: 16, 2: 8}[l] for l in range(num_layers)]
+    anchor_mask = (
+        [[6, 7, 8], [3, 4, 5], [0, 1, 2]] if num_layers == 3 else [[3, 4, 5], [1, 2, 3]]
+    )
+    
+    # Define output signature for tf.data.Dataset
+    img_h, img_w = input_shape[0], input_shape[1]
+    
+    output_signature = (
+        (
+            tf.TensorSpec(shape=(batch_size, img_h, img_w, 3), dtype=tf.float32),
+            tf.TensorSpec(shape=(batch_size, int(grid_shapes[0][0]), int(grid_shapes[0][1]), len(anchor_mask[0]), 5 + num_classes), dtype=tf.float32),
+            tf.TensorSpec(shape=(batch_size, int(grid_shapes[1][0]), int(grid_shapes[1][1]), len(anchor_mask[1]), 5 + num_classes), dtype=tf.float32),
+            tf.TensorSpec(shape=(batch_size, int(grid_shapes[2][0]), int(grid_shapes[2][1]), len(anchor_mask[2]), 5 + num_classes), dtype=tf.float32),
+        ),
+        tf.TensorSpec(shape=(batch_size,), dtype=tf.float32),
+    )
+    
+    gen = data_generator(
         annotation_lines, batch_size, input_shape, anchors, num_classes
     )
 
