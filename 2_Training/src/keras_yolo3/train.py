@@ -3,11 +3,11 @@ Retrain the YOLO model for your own dataset.
 """
 
 import numpy as np
-import keras.backend as K
-from keras.layers import Input, Lambda
-from keras.models import Model
-from keras.optimizers import Adam
-from keras.callbacks import (
+import tensorflow.keras.backend as K
+from tensorflow.keras.layers import Input, Lambda
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import (
     TensorBoard,
     ModelCheckpoint,
     ReduceLROnPlateau,
@@ -53,11 +53,10 @@ def _main():
     # checkpoint = ModelCheckpoint(log_dir + 'ep{epoch:03d}-loss{loss:.3f}-val_loss{val_loss:.3f}.h5',
     #     monitor='val_loss', save_weights_only=True, save_best_only=True, period=3)
     checkpoint = ModelCheckpoint(
-        log_dir + "checkpoint.h5",
+        log_dir + "checkpoint.weights.h5", # Use weights.h5 for compatibility
         monitor="val_loss",
         save_weights_only=True,
-        save_best_only=True,
-        period=5,
+        save_best_only=True, # deprecated parameter (period)
     )
     reduce_lr = ReduceLROnPlateau(monitor="val_loss", factor=0.1, patience=3, verbose=1)
     early_stopping = EarlyStopping(
@@ -77,7 +76,7 @@ def _main():
     # Adjust num epochs to your dataset. This step is enough to obtain a not bad model.
     if True:
         model.compile(
-            optimizer=Adam(lr=1e-3),
+            optimizer=Adam(learning_rate=1e-3),
             loss={
                 # use custom yolo_loss Lambda layer.
                 "yolo_loss": lambda y_true, y_pred: y_pred
@@ -90,7 +89,7 @@ def _main():
                 num_train, num_val, batch_size
             )
         )
-        model.fit_generator(
+        model.fit(
             data_generator_wrapper(
                 lines[:num_train], batch_size, input_shape, anchors, num_classes
             ),
@@ -103,7 +102,7 @@ def _main():
             initial_epoch=0,
             callbacks=[logging, checkpoint],
         )
-        model.save_weights(log_dir + "trained_weights_stage_1.h5")
+        model.save_weights(log_dir + "trained_weights_stage_1.weights.h5")
 
     # Unfreeze and continue training, to fine-tune.
     # Train longer if the result is not good.
@@ -111,7 +110,7 @@ def _main():
         for i in range(len(model.layers)):
             model.layers[i].trainable = True
         model.compile(
-            optimizer=Adam(lr=1e-4), loss={"yolo_loss": lambda y_true, y_pred: y_pred}
+            optimizer=Adam(learning_rate=1e-4), loss={"yolo_loss": lambda y_true, y_pred: y_pred}
         )  # recompile to apply the change
         print("Unfreeze all of the layers.")
 
@@ -123,7 +122,7 @@ def _main():
                 num_train, num_val, batch_size
             )
         )
-        model.fit_generator(
+        model.fit(
             data_generator_wrapper(
                 lines[:num_train], batch_size, input_shape, anchors, num_classes
             ),
@@ -136,7 +135,7 @@ def _main():
             initial_epoch=epoch1,
             callbacks=[logging, checkpoint, reduce_lr, early_stopping],
         )
-        model.save_weights(log_dir + "trained_weights_final.h5")
+        model.save_weights(log_dir + "trained_weights_final.weights.h5")
 
     # Further training if needed.
 
@@ -282,7 +281,7 @@ def create_tiny_model(
 
 
 def data_generator(annotation_lines, batch_size, input_shape, anchors, num_classes):
-    """data generator for fit_generator"""
+    """data generator for fit"""
     n = len(annotation_lines)
     i = 0
     while True:
