@@ -102,13 +102,16 @@ def _main(args):
     prev_layer = input_layer
     all_layers = []
 
+    # Store layer references and their weights for setting after model creation
+    layer_weights = {}
+
     weight_decay = (
         float(cfg_parser["net_0"]["decay"])
-        if "net_0" in cfg_parser.sections()
-        else 5e-4
     )
+    
     count = 0
     out_index = []
+    layer_count = 0
     for section in cfg_parser.sections():
         print("Parsing section {}".format(section))
         if section.startswith("convolutional"):
@@ -185,6 +188,8 @@ def _main(args):
             if stride > 1:
                 # Darknet uses left and top padding instead of 'same' mode
                 prev_layer = ZeroPadding2D(((1, 0), (1, 0)))(prev_layer)
+
+            #Exclude weights for Conv2D for compatibility with Tensorflow 2.x.x
             conv_layer = (
                 Conv2D(
                     filters,
@@ -192,14 +197,21 @@ def _main(args):
                     strides=(stride, stride),
                     kernel_regularizer=l2(weight_decay),
                     use_bias=not batch_normalize,
-                    weights=conv_weights,
                     activation=act_fn,
                     padding=padding,
                 )
-            )(prev_layer)
+            )
+
+            #Save layers and weights after construction of the model
+            layer_weights[layer_counter] = (conv_layer_obj, conv_weights)
+            layer_count += 1
 
             if batch_normalize:
-                conv_layer = (BatchNormalization(weights=bn_weight_list))(conv_layer)
+                bn_obj = BatchNormalization()
+                conv_layer = bn_obj(conv_layer)
+                # Store BatchNormalization layer and weights
+                layer_weights[layer_counter] = (bn_obj, bn_weight_list)
+                layer_counter += 1
             prev_layer = conv_layer
 
             if activation == "linear":
@@ -260,6 +272,15 @@ def _main(args):
     if len(out_index) == 0:
         out_index.append(len(all_layers) - 1)
     model = Model(inputs=input_layer, outputs=[all_layers[i] for i in out_index])
+
+# Set weights on all layers (TensorFlow 2.x requires set_weights after model construction)
+    print("Setting weights for layer...")
+    for layer_idx, (layer_obj, weights_list) in layer_weights.items():
+        try:
+            layer_obj.set_weights(weights_list)
+        except Exception as e:
+            print(f"Warning: Setiing layer weights unsuccessful {layer_idx}: {e}")
+    
     print(model.summary())
     if args.weights_only:
         model.save_weights("{}".format(output_path))
