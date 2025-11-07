@@ -97,8 +97,8 @@ if __name__ == "__main__":
                 error_msg += f" - {h5_file} was not created"
             print(f"\n✗ Error: {error_msg}\n")
             raise RuntimeError(f"Failed to convert {weights_file} to {h5_file}")
-        else:
-            file_size = os.path.getsize(h5_path) / (1024 * 1024)  # Size in MB
+    else:
+        file_size = os.path.getsize(h5_path) / (1024 * 1024)  # Size in MB
         print(f"\n✓ {h5_file} already exists at {h5_path}")
         print(f"  File size: {file_size:.2f} MB")
         print(f"  Skipped conversion.\n")
