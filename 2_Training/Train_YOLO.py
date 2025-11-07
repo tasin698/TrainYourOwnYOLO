@@ -200,9 +200,9 @@ if __name__ == "__main__":
     if not weights_path or weights_path.strip() == "" or not os.path.isfile(weights_path):
         load_pretrained = False
         print("Training from scratch (no pretrained weights)")
-        freeze_body = 0  # Don't freeze when training from scratch
+        freeze_body = 0  # Don't freeze any layers when training from scratch
     else:
-        freeze_body = 2  # Freeze majority layers when using pretrained weights
+        freeze_body = 2  # Freeze most layers when using pretrained weights
 
     is_tiny_version = len(anchors) == 6  # default setting
     if FLAGS.is_tiny:
@@ -214,8 +214,10 @@ if __name__ == "__main__":
         )
     else:
         model = create_model(
-            input_shape, anchors, num_classes, load_pretrained=load_pretrained,
-            freeze_body=freeze_body, weights_path=weights_path
+            input_shape, anchors, num_classes, 
+            load_pretrained=load_pretrained, 
+            freeze_body=freeze_body, 
+            weights_path=weights_path
         )  # make sure you know what you freeze
 
     log_dir_time = os.path.join(log_dir, "{}".format(int(time())))
@@ -225,6 +227,8 @@ if __name__ == "__main__":
         monitor="val_loss",
         save_weights_only=True,
         save_best_only=True,
+        # In TF 2.x, save_freq is not needed when save_best_only=True
+        # The model will be saved whenever val_loss improves
     )
     reduce_lr = ReduceLROnPlateau(monitor="val_loss", factor=0.1, patience=3, verbose=1)
     early_stopping = EarlyStopping(
