@@ -69,22 +69,23 @@ if __name__ == "__main__":
 
         end = time.time()
         print(f"Downloaded Raw {weights_file} in {end - start:.1f} seconds\n")
-
-        # Convert weights to H5 if H5 file doesn't exist
+    
+    # Convert weights to H5 if H5 file doesn't exist
     if not os.path.isfile(h5_path):
         if not os.path.isfile(weights_path):
             raise FileNotFoundError(
                 f"Weights file {weights_file} not found at {weights_path}. "
                 f"Please run the download script first."
             )
+        
         print(f"\nConverting {weights_file} to {h5_file}\n")
         print(f"Weights file: {weights_path}")
         print(f"Output file: {h5_path}")
         print(f"Working directory: {download_folder}\n")
-
+        
         call_string = f"python convert.py {cfg_file} {weights_file} {h5_file}"
         result = subprocess.call(call_string, shell=True, cwd=download_folder)
-
+        
         # Verify conversion was successful
         if result == 0 and os.path.isfile(h5_path):
             file_size = os.path.getsize(h5_path) / (1024 * 1024)  # Size in MB
@@ -101,4 +102,4 @@ if __name__ == "__main__":
         file_size = os.path.getsize(h5_path) / (1024 * 1024)  # Size in MB
         print(f"\n✓ {h5_file} already exists at {h5_path}")
         print(f"  File size: {file_size:.2f} MB")
-        print(f"  Skipped conversion.\n")
+        print(f"  Skipping conversion.\n")
