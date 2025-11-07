@@ -139,14 +139,15 @@ def tiny_yolo_body(inputs, num_anchors, num_classes):
 def yolo_head(feats, anchors, num_classes, input_shape, calc_loss=False):
     """Convert final layer features to bounding box parameters."""
     num_anchors = len(anchors)
-    
     # Reshape to batch, height, width, num_anchors, box_params.
+    # Get grid_shape - handle KerasTensors during graph construction
+    # During model initialization, KerasTensors don't have fully defined shapes
     # We need to compute grid_shape from input_shape or use a placeholder
     from tensorflow.keras import ops
     # Use ops.reshape for KerasTensor compatibility
     anchors_tensor = ops.reshape(K.constant(anchors), [1, 1, 1, num_anchors, 2])
     
-    # Try to get static shape first
+    # Try to get static shape first (works during graph construction if shape is known)
     grid_h = None
     grid_w = None
     
@@ -162,9 +163,12 @@ def yolo_head(feats, anchors, num_classes, input_shape, calc_loss=False):
         except (AttributeError, IndexError, TypeError):
             pass
     
+    # If static shape not available, compute from input_shape
+    # This is the most reliable approach during graph construction
     # Always set fallback values first to ensure we never have None
     if grid_h is None or grid_w is None:
         # Compute approximate grid_shape from input_shape
+        # YOLOv3 uses different strides for different layers, but we'll use a default
         # The actual shape will be computed correctly during inference
         if isinstance(input_shape, tf.Tensor):
             # Use input_shape to compute grid (will be refined during execution)
@@ -173,7 +177,7 @@ def yolo_head(feats, anchors, num_classes, input_shape, calc_loss=False):
             grid_h = tf.gather(grid_shape_fallback, 0)  # Use tf.gather for safe indexing
             grid_w = tf.gather(grid_shape_fallback, 1)
         else:
-            # Static computation from input_shape
+            # Static computation from input_shape - ensure we get integers
             try:
                 grid_h = int(input_shape[0] // 32) if input_shape[0] is not None else 13
                 grid_w = int(input_shape[1] // 32) if input_shape[1] is not None else 13
@@ -181,6 +185,9 @@ def yolo_head(feats, anchors, num_classes, input_shape, calc_loss=False):
                 # Ultimate fallback - use default YOLOv3 grid size
                 grid_h = 13
                 grid_w = 13
+        
+        # Try to refine using ops.shape if possible (works in eager mode)
+        # This will override the fallback during execution if shape is available
         try:
             shape_tensor = ops.shape(feats)
             # Use tf.gather to safely extract dimensions
