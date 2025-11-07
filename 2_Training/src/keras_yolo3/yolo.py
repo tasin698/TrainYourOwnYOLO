@@ -16,8 +16,7 @@ from .yolo3.model import yolo_eval, yolo_body, tiny_yolo_body
 from .yolo3.utils import letterbox_image
 import os
 import tensorflow as tf
-
-import tensorflow.python.keras.backend as K
+from tensorflow.keras import backend as K
 
 
 class YOLO(object):
@@ -43,7 +42,6 @@ class YOLO(object):
         self.__dict__.update(kwargs)  # and update with user overrides
         self.class_names = self._get_class()
         self.anchors = self._get_anchors()
-        self.sess = K.get_session()
         self.boxes, self.scores, self.classes = self.generate()
 
     def _get_class(self):
@@ -62,7 +60,7 @@ class YOLO(object):
 
     def generate(self):
         model_path = os.path.expanduser(self.model_path)
-        # Accept both .h5 and .weights.h5 extensions
+        # Allow both .h5 and .weights.h5 extensions
         assert model_path.endswith(".h5") or model_path.endswith(".weights.h5"), \
             "Keras model or weights must be a .h5 or .weights.h5 file."
 
@@ -137,12 +135,14 @@ class YOLO(object):
             np.random.seed(None)  # Reset seed to default.
 
         # Generate output tensor targets for filtered bounding boxes.
+        # Note: In eager execution, we compute these dynamically in detect_image
+        # These are placeholders and won't be used directly
         dummy_shape = tf.constant([416, 416], dtype=tf.float32)
         boxes, scores, classes = yolo_eval(
             self.yolo_model.output,
             self.anchors,
             len(self.class_names),
-            dummy_shape, #placeholder
+            dummy_shape,  # placeholder, actual shape computed in detect_image
             score_threshold=self.score,
             iou_threshold=self.iou,
         )
@@ -163,13 +163,14 @@ class YOLO(object):
             )
             boxed_image = letterbox_image(image, new_image_size)
             input_shape = tf.constant([new_image_size[1], new_image_size[0]], dtype=tf.float32)
+        
         image_data = np.array(boxed_image, dtype="float32")
         if show_stats:
             print(image_data.shape)
         image_data /= 255.0
         image_data = np.expand_dims(image_data, 0)  # Add batch dimension.
 
-         # Get predictions using eager execution
+        # Get predictions using eager execution
         model_outputs = self.yolo_model(image_data, training=False)
         
         # YOLO models return list of tensors [y1, y2, y3] for full YOLO or [y1, y2] for tiny
@@ -189,12 +190,11 @@ class YOLO(object):
             score_threshold=self.score,
             iou_threshold=self.iou,
         )
+        
         # Convert tensors to numpy arrays
         out_boxes = boxes.numpy()
         out_scores = scores.numpy()
         out_classes = classes.numpy()
-
-        
         if show_stats:
             print("Found {} boxes for {}".format(len(out_boxes), "img"))
         out_prediction = []
@@ -212,6 +212,7 @@ class YOLO(object):
 
             label = "{} {:.2f}".format(predicted_class, score)
             draw = ImageDraw.Draw(image)
+            # textsize is deprecated in Pillow 10.0.0+, use textbbox instead
             try:
                 bbox = draw.textbbox((0, 0), label, font=font)
                 label_size = (bbox[2] - bbox[0], bbox[3] - bbox[1])
@@ -224,7 +225,8 @@ class YOLO(object):
             bottom = min(image.size[1], np.floor(bottom + 0.5).astype("int32"))
             right = min(image.size[0], np.floor(right + 0.5).astype("int32"))
 
-            # Check bounding box coordinates: ensure left < right and top < bottom
+            # Validate bounding box coordinates: ensure left < right and top < bottom
+            # Skip invalid boxes (can happen with coordinate conversion issues)
             if top >= bottom or left >= right:
                 continue
             # image was expanded to model_image_size: make sure it did not pick
@@ -262,6 +264,7 @@ class YOLO(object):
         return out_prediction, image
 
     def close_session(self):
+        # No session to close in eager execution
         pass
 
 
@@ -299,6 +302,7 @@ def detect_video(yolo, video_path, output_path=""):
         image = Image.fromarray(frame)
         out_pred, image = yolo.detect_image(image, show_stats=False)
         result = np.asarray(image)
+        # Make a writable copy to avoid readonly array error with cv2.putText
         result = result.copy()
         curr_time = timer()
         exec_time = curr_time - prev_time
